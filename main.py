@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+import pytz
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -9,11 +11,16 @@ from telegram.ext import (
     filters,
 )
 
-# Aapka naya Telegram Bot Token
+# Aapka Telegram Bot Token
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8823664522:AAHGeBM2iS-JD-pxZhUVlT0X-d3MxO1aC2k")
 
-# Users ke stars tracking ke liye dictionary
+# Users aur transactions data store karne ke liye
 user_stars_db = {}
+# Har payment ka record rakhne ke liye list (timestamp aur amount)
+transactions_log = []
+
+# Karachi Timezone set karein
+KARACHI_TZ = pytz.timezone("Asia/Karachi")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount = 10
@@ -44,12 +51,22 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     user_id = user.id
     user_name = user.full_name or user.username or "Unknown"
 
+    # Current time Karachi timezone mein nikalain
+    now_karachi = datetime.now(KARACHI_TZ)
+
     # Stars database update
     if user_id not in user_stars_db:
         user_stars_db[user_id] = {"name": user_name, "stars": 0}
     
     user_stars_db[user_id]["stars"] += amount
     user_stars_db[user_id]["name"] = user_name
+
+    # Transaction log mein save karein (Hour aur Amount)
+    transactions_log.append({
+        "hour": now_karachi.hour,
+        "amount": amount,
+        "time": now_karachi
+    })
 
     # Successful payment message
     await update.message.reply_text(
@@ -69,6 +86,37 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{idx}. {udata['name']} - {udata['stars']} Stars\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
+
+async def peak_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not transactions_log:
+        await update.message.reply_text("Abhi tak koi payment record nahi hai.")
+        return
+
+    # Har ghante (0 se 23) ke total stars calculate karein
+    hour_totals = {i: 0 for i in range(24)}
+    for tx in transactions_log:
+        hour_totals[tx["hour"]] += tx["amount"]
+
+    # Sab se zyada stars kis ghante mein aaye woh dhoondhein
+    best_hour = max(hour_totals, key=hour_totals.get)
+    max_stars = hour_totals[best_hour]
+
+    if max_stars == 0:
+        await update.message.reply_text("Abhi tak kisi ghante mein stars receive nahi hue.")
+        return
+
+    # 12-hour format mein convert karne ke liye (e.g., 03:00 PM - 04:00 PM)
+    dt_start = datetime.strptime(str(best_hour), "%H")
+    time_str_start = dt_start.strftime("%I:00 %p")
+    dt_end = datetime.strptime(str((best_hour + 1) % 24), "%H")
+    time_str_end = dt_end.strftime("%I:00 %p")
+
+    await update.message.reply_text(
+        f"⏰ **Peak Star Time (Asia/Karachi)** ⏰\n\n"
+        f"Aapko sab se zyada stars **{time_str_start} se {time_str_end}** ke beech milte hain!\n"
+        f"Total Stars in this hour slot: **{max_stars} Stars**",
+        parse_mode="Markdown"
+    )
 
 async def hourly_ping(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -91,6 +139,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("peak", peak_time))
     app.add_handler(CommandHandler("ping", start_ping))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
