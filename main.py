@@ -1,7 +1,10 @@
 import os
+import ast
+import operator
+import sqlite3
 from datetime import datetime
 import pytz
-from telegram import Update
+from telegram import Update, LabeledPrice
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -11,17 +14,149 @@ from telegram.ext import (
     filters,
 )
 
-# Aapka Telegram Bot Token
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8823664522:AAHGeBM2iS-JD-pxZhUVlT0X-d3MxO1aC2k")
+# Optional Gemini AI import
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
-# Users aur transactions data store karne ke liye
-user_stars_db = {}
-# Har payment ka record rakhne ke liye list (timestamp aur amount)
-transactions_log = []
+# Configuration
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8608163715:AAEDtBaTVxZwip9tbm87CK11Cf0zJZrT1gc")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+DB_FILE = "bot_data.db"
 
-# Karachi Timezone set karein
+# Timezone Configuration
 KARACHI_TZ = pytz.timezone("Asia/Karachi")
 
+# Initialize Gemini AI if key is provided
+if GEMINI_AVAILABLE and GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    ai_model = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    ai_model = None
+
+# ---------------------------------------------------------
+# Database Operations (SQLite)
+# ---------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            stars INTEGER DEFAULT 0
+        )
+    """)
+    
+    # Transactions table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            hour INTEGER,
+            timestamp TEXT
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+def record_payment(user_id: int, user_name: str, amount: int, hour: int, timestamp: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Update or insert user record
+    cursor.execute("""
+        INSERT INTO users (user_id, name, stars)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            name = excluded.name,
+            stars = stars + excluded.stars
+    """, (user_id, user_name, amount))
+    
+    # Log transaction
+    cursor.execute("""
+        INSERT INTO transactions (user_id, amount, hour, timestamp)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, amount, hour, timestamp))
+    
+    conn.commit()
+    conn.close()
+
+def get_top_users(limit: int = 50):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT name, stars FROM users
+        ORDER BY stars DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def get_peak_hours():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT hour, SUM(amount) as total_stars
+        FROM transactions
+        GROUP BY hour
+        ORDER BY total_stars DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+# ---------------------------------------------------------
+# Safe Calculator Helper (AST Parsing)
+# ---------------------------------------------------------
+SAFE_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+def safe_eval(node):
+    if isinstance(node, ast.Num):
+        return node.n
+    elif isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("Unsupported constant type")
+    elif isinstance(node, ast.BinOp):
+        left = safe_eval(node.left)
+        right = safe_eval(node.right)
+        op_type = type(node.op)
+        if op_type in SAFE_OPERATORS:
+            return SAFE_OPERATORS[op_type](left, right)
+        raise ValueError(f"Unsupported binary operator: {op_type.__name__}")
+    elif isinstance(node, ast.UnaryOp):
+        operand = safe_eval(node.operand)
+        op_type = type(node.op)
+        if op_type in SAFE_OPERATORS:
+            return SAFE_OPERATORS[op_type](operand)
+        raise ValueError(f"Unsupported unary operator: {op_type.__name__}")
+    else:
+        raise ValueError("Invalid mathematical expression")
+
+def calculate_expression(expr: str):
+    parsed = ast.parse(expr, mode='eval')
+    return safe_eval(parsed.body)
+
+# ---------------------------------------------------------
+# Telegram Bot Handlers
+# ---------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount = 10
     if context.args and context.args[0].isdigit():
@@ -32,9 +167,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title="Star Purchase",
             description=f"Payment for {amount} Stars",
             payload=f"stars-payload-{amount}",
-            provider_token="",  # Telegram Stars ke liye empty rakhein
+            provider_token="",  # Telegram Stars requires empty string
             currency="XTR",
-            prices=[{"label": "Stars", "amount": amount}]
+            prices=[LabeledPrice(label="Stars", amount=amount)]
         )
         await update.message.reply_text(f"Here is your payment link:\n{invoice_link}")
     except Exception as e:
@@ -51,72 +186,89 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     user_id = user.id
     user_name = user.full_name or user.username or "Unknown"
 
-    # Current time Karachi timezone mein nikalain
     now_karachi = datetime.now(KARACHI_TZ)
+    timestamp_str = now_karachi.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Stars database update
-    if user_id not in user_stars_db:
-        user_stars_db[user_id] = {"name": user_name, "stars": 0}
-    
-    user_stars_db[user_id]["stars"] += amount
-    user_stars_db[user_id]["name"] = user_name
+    # Record into SQLite database
+    record_payment(user_id, user_name, amount, now_karachi.hour, timestamp_str)
 
-    # Transaction log mein save karein (Hour aur Amount)
-    transactions_log.append({
-        "hour": now_karachi.hour,
-        "amount": amount,
-        "time": now_karachi
-    })
-
-    # Successful payment message
     await update.message.reply_text(
         f"Thank you for your payment of {amount} Stars!\n\n"
         f"Contact @jasonpvo for your stuff."
     )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_stars_db:
+    top_50 = get_top_users(50)
+    if not top_50:
         await update.message.reply_text("Abhi tak kisi ne stars nahi diye hain.")
         return
 
-    sorted_users = sorted(user_stars_db.values(), key=lambda x: x["stars"], reverse=True)
-    
-    text = "⭐ **Top Star Contributors** ⭐\n\n"
-    for idx, udata in enumerate(sorted_users[:10], start=1):
-        text += f"{idx}. {udata['name']} - {udata['stars']} Stars\n"
+    text = f"⭐ **Top {len(top_50)} Star Contributors** ⭐\n\n"
+    for idx, (name, stars) in enumerate(top_50, start=1):
+        medal = "🥇 " if idx == 1 else "🥈 " if idx == 2 else "🥉 " if idx == 3 else f"{idx}. "
+        text += f"{medal}{name} - **{stars}** Stars\n"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    # Send long texts safely
+    if len(text) > 4000:
+        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for chunk in chunks:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown")
 
 async def peak_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not transactions_log:
+    peaks = get_peak_hours()
+    if not peaks:
         await update.message.reply_text("Abhi tak koi payment record nahi hai.")
         return
 
-    # Har ghante (0 se 23) ke total stars calculate karein
-    hour_totals = {i: 0 for i in range(24)}
-    for tx in transactions_log:
-        hour_totals[tx["hour"]] += tx["amount"]
+    # Take top 3 to 4 peaks
+    top_peaks = peaks[:4]
 
-    # Sab se zyada stars kis ghante mein aaye woh dhoondhein
-    best_hour = max(hour_totals, key=hour_totals.get)
-    max_stars = hour_totals[best_hour]
+    text = "⏰ **Peak Star Activity Hours (Asia/Karachi)** ⏰\n\n"
+    for idx, (hour, total) in enumerate(top_peaks, start=1):
+        dt_start = datetime.strptime(str(hour), "%H")
+        time_str_start = dt_start.strftime("%I:00 %p")
+        dt_end = datetime.strptime(str((hour + 1) % 24), "%H")
+        time_str_end = dt_end.strftime("%I:00 %p")
 
-    if max_stars == 0:
-        await update.message.reply_text("Abhi tak kisi ghante mein stars receive nahi hue.")
+        text += f"🏆 **#{idx} Peak**: `{time_str_start} - {time_str_end}` → **{total} Stars**\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: `/calc <expression>`\nExample: `/calc 25 * 4 + 10`", parse_mode="Markdown")
         return
 
-    # 12-hour format mein convert karne ke liye (e.g., 03:00 PM - 04:00 PM)
-    dt_start = datetime.strptime(str(best_hour), "%H")
-    time_str_start = dt_start.strftime("%I:00 %p")
-    dt_end = datetime.strptime(str((best_hour + 1) % 24), "%H")
-    time_str_end = dt_end.strftime("%I:00 %p")
+    expression = " ".join(context.args)
+    try:
+        result = calculate_expression(expression)
+        await update.message.reply_text(f"🧮 **Result:** `{result}`", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Invalid expression. Error: `{e}`", parse_mode="Markdown")
 
-    await update.message.reply_text(
-        f"⏰ **Peak Star Time (Asia/Karachi)** ⏰\n\n"
-        f"Aapko sab se zyada stars **{time_str_start} se {time_str_end}** ke beech milte hain!\n"
-        f"Total Stars in this hour slot: **{max_stars} Stars**",
-        parse_mode="Markdown"
-    )
+async def ai_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ai_model:
+        await update.message.reply_text("AI feature is currently disabled or `GEMINI_API_KEY` is not set.")
+        return
+
+    prompt = " ".join(context.args) if context.args else ""
+    if not prompt and update.message.reply_to_message:
+        prompt = update.message.reply_to_message.text
+
+    if not prompt:
+        await update.message.reply_text("Usage: `/ai <your question>` or reply to a message with `/ai`.", parse_mode="Markdown")
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        response = ai_model.generate_content(prompt)
+        reply_text = response.text if response.text else "Sorry, I could not generate an answer."
+        await update.message.reply_text(reply_text)
+    except Exception as e:
+        await update.message.reply_text(f"AI Error: {e}")
 
 async def hourly_ping(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -125,7 +277,11 @@ async def hourly_ping(context: ContextTypes.DEFAULT_TYPE):
 
 async def start_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    
+
+    if not context.job_queue:
+        await update.message.reply_text("JobQueue is not initialized. Make sure 'APScheduler' is installed.")
+        return
+
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     if current_jobs:
         await update.message.reply_text("Har ghante ping-pong pehle se active hai.")
@@ -135,11 +291,16 @@ async def start_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Har ghante 'Ping-Pong' notification start ho gaya hai!")
 
 def main():
+    # Initialize SQLite Database
+    init_db()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("peak", peak_time))
+    app.add_handler(CommandHandler("calc", calc))
+    app.add_handler(CommandHandler("ai", ai_ask))
     app.add_handler(CommandHandler("ping", start_ping))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
